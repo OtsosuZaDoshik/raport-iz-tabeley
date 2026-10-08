@@ -1,0 +1,37 @@
+name: Сборка exe для Windows
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Установка зависимостей
+        run: pip install openpyxl==3.1.5 pyinstaller==6.11.1
+
+      - name: Сборка
+        run: pyinstaller --onefile --console --name sobrat_raport app/sobrat_raport.py
+
+      # Без шаблона рядом exe должен вежливо сообщить, что шаблона нет, — значит, всё упаковалось.
+      - name: Проверка запуска
+        shell: pwsh
+        run: |
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          $out = & .\dist\sobrat_raport.exe 2>&1 | Out-String
+          Write-Output $out
+          if ($out -match 'Traceback|Failed to execute' -or $out -notmatch 'xlsx') { exit 1 }
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sobrat_raport-exe
+          path: dist/sobrat_raport.exe
