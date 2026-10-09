@@ -365,10 +365,14 @@ def find_blocks(ws) -> dict:
 def make_comment(lines: list) -> Comment:
     """Примечание как в рапортах, составленных вручную: подпись, затем нумерованный список."""
     body = [f"{i}. {line}" for i, line in enumerate(lines, start=1)]
-    text = f"{COMMENT_AUTHOR}:\n" + "\n".join(body)
-    width = max(144, 7 * max(len(s) for s in body))
-    height = max(79, 15 * (len(body) + 1) + 10)
-    return Comment(text, COMMENT_AUTHOR, height=height, width=width)
+    all_lines = [f"{COMMENT_AUTHOR}:"] + body
+    # Размер окна в пикселях: шрифт примечаний Tahoma 9 занимает ~6-7 px на букву и ~17 px
+    # на строку; берём 8 и 18 с запасом, иначе Excel обрезает последние строки.
+    # Длинные строки переносятся — их считаем за несколько.
+    width = min(max(160, 8 * max(len(s) for s in all_lines) + 30), 340)
+    rows = sum(-(-len(s) * 8 // (width - 30)) for s in all_lines)
+    height = max(79, 18 * rows + 20)
+    return Comment(f"{COMMENT_AUTHOR}:\n" + "\n".join(body), COMMENT_AUTHOR, height=height, width=width)
 
 
 def fill_block(ws, h: int, res: SiteResult):
