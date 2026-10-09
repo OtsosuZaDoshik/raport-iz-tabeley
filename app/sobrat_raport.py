@@ -5,8 +5,10 @@
 
 Правила подсчёта повторяют то, как рапорт составляется вручную:
   * «в производстве» — операторы и сварщики с часами > 0 за ночь (D-1) и день (D);
-  * стажёры и ВЦР входят в «в производстве» и дополнительно пишутся в свои строки;
-  * статусы «Не в работе» / «На больничном» — только из дневной смены D.
+  * стажёры (обе смены) и ВЦР (только дневная смена, включая «логист») входят
+    в «в производстве» и дополнительно пишутся в свои строки;
+  * статусы «Не в работе» / «На больничном» — только из дневной смены D;
+  * к каждой заполненной ячейке — примечание со списком людей, как делалось вручную.
 """
 from __future__ import annotations
 
@@ -30,11 +32,14 @@ else:
 sys.path.insert(0, str(APP_DIR / "lib"))
 
 import openpyxl  # noqa: E402
+from openpyxl.comments import Comment  # noqa: E402
 from openpyxl.styles import Font, PatternFill  # noqa: E402
 
 warnings.filterwarnings("ignore", module="openpyxl")
 
 TEMPLATE_PATH = APP_DIR / "Шаблон рапорта.xlsx"
+# В .exe шаблон вшит; настроенный шаблон в папке app рядом с .exe главнее.
+BUNDLED_TEMPLATE = Path(getattr(sys, "_MEIPASS", APP_DIR)) / TEMPLATE_PATH.name
 TIMESHEETS_DIR = ROOT_DIR / "Табели"
 REPORTS_DIR = ROOT_DIR / "Рапорты"
 ERROR_LOG = ROOT_DIR / "ошибка.txt"
@@ -60,8 +65,11 @@ OPERATOR_POSITIONS = {
 }
 WELDER_TRAINEE_ROW = "стажеры-сварщики"
 
-# Отметки в «Справке» у работавших, которые на рапорт не влияют.
-NEUTRAL_NOTES = ("логист",)
+# Отметки в «Справке» у работавших в дневную смену, которые идут в строку «ВЦР».
+VCR_NOTES = ("вцр", "логист")
+
+# Подпись в начале примечаний к ячейкам (как в рапортах, составленных вручную).
+COMMENT_AUTHOR = "МЕНЕДЖЕР ПО ПЕРСОНАЛУ_1"
 
 # Ячейки рапорта, которые программа считает сама (остальные не трогает).
 AUTO_ROWS = [
@@ -105,9 +113,13 @@ class Timesheet:
 @dataclass
 class SiteResult:
     counts: Counter = field(default_factory=Counter)
-    arrivals: Counter = field(default_factory=Counter)
+    names: dict = field(default_factory=dict)      # строка рапорта -> строки примечания
     rows: list = field(default_factory=list)       # строки листа «Проверка»
     attention: list = field(default_factory=list)  # что дописать вручную
+
+    def add(self, label: str, line: str):
+        self.counts[label] += 1
+        self.names.setdefault(label, []).append(line)
 
 
 class UserError(Exception):
@@ -196,6 +208,12 @@ def person_key(name: str) -> str:
     return " ".join(norm(name).split()[:2])
 
 
+def short_name(name: str) -> str:
+    """«Кабаков Дмитрий Константинович» -> «Кабаков Д», как в примечаниях к рапорту."""
+    parts = name.split()
+    return f"{parts[0]} {parts[1][0]}" if len(parts) > 1 else name
+
+
 # ------------------------------------------------------------------ чтение табеля
 def read_timesheet(path: Path) -> Timesheet:
     """Читает табель .xlsx. Бросает ValueError, если файл не похож на табель."""
@@ -274,20 +292,15 @@ def find_tables(ws) -> tuple[int, list]:
 
 
 # ------------------------------------------------------------------ подсчёт
-def absence(note: str, report_date: dt.date) -> tuple[str, object]:
+def absence(note: str) -> tuple[str, str]:
     """Куда отнести человека с 0 часов в дневной смене: (вид, значение)."""
     n = norm(note)
     if not n:
-        return "attention", "0 часов и пустая «Справка»"
+        return "attention", "0 часов и пустая «Справка», впишите вручную"
     if "межвахт" in n:
         return "skip", "межвахта — не на площадке, не учитывается"
-    m = re.search(r"\bс\s*(\d{1,2}\.\d{1,2}(?:\.\d{2,4})?)", n)
-    if m:
-        d = to_date(m.group(1), year_hint=report_date.year)
-        if d and d < report_date - dt.timedelta(days=180):
-            d = d.replace(year=d.year + 1)
-        if d:
-            return "arrival", d
+    if re.search(r"\bс\s*\d{1,2}\.\d{1,2}", n):
+        return "attention", f"отметка «{note}» — прибытие программа не ставит, проверьте по графику"
     if n in ("д/о", "до", "д.о", "д/о.") or "выходн" in n:
         return "row", "выходной"
     if "бол" in n or "простуд" in n or "б/л" in n:
@@ -298,47 +311,45 @@ def absence(note: str, report_date: dt.date) -> tuple[str, object]:
         return "row", "алкоголь"
     if "простой" in n:
         return "row", "простой"
-    return "attention", f"отметка «{note}» — программа не знает, куда её отнести"
+    return "attention", f"отметка «{note}» — программа не знает, куда её отнести, впишите вручную"
 
 
-def count_site(sheets: list, report_date: dt.date) -> SiteResult:
+def count_site(sheets: list) -> SiteResult:
     res = SiteResult()
     for ts in sorted(sheets, key=lambda t: t.shift != NIGHT):
         for p in ts.people:
-            how, flag = count_person(p, ts, report_date, res)
+            how, flag = count_person(p, ts, res)
             res.rows.append([ts.site, ts.shift, p.name, p.position, p.hours, p.note, how, ts.path.name, flag])
     return res
 
 
-def count_person(p: Person, ts: Timesheet, report_date: dt.date, res: SiteResult) -> tuple[str, bool]:
+def count_person(p: Person, ts: Timesheet, res: SiteResult) -> tuple[str, bool]:
     if not p.kind:
         return "не учитывается (не оператор и не сварщик)", False
     n = norm(p.note)
+    short = short_name(p.name)
     if p.hours > 0:
         res.counts["в производстве"] += 1
-        how = "в производстве"
         if "стаж" in n:
-            res.counts[p.trainee_row] += 1
-            how += f" + {p.trainee_row}"
-        if "вцр" in n:
-            res.counts["ВЦР"] += 1
-            how += " + ВЦР"
-        known = "стаж" in n or "вцр" in n or any(w in n for w in NEUTRAL_NOTES)
-        if n and not known:
-            return how + f" (отметка «{p.note}» не распознана)", True
-        return how, False
+            res.add(p.trainee_row, f"{short} - {p.note} ({ts.shift} {ts.date:%d.%m})")
+            return f"в производстве + {p.trainee_row}", False
+        if not n:
+            return "в производстве", False
+        if ts.shift == NIGHT:
+            return "в производстве (отметки ночной смены, кроме стажёров, в рапорт не идут)", False
+        if any(w in n for w in VCR_NOTES):
+            res.add("ВЦР", f"{short} - {p.note}")
+            return "в производстве + ВЦР", False
+        return f"в производстве (отметка «{p.note}» не распознана)", True
     if ts.shift == NIGHT:
         return "не учитывается: 0 часов в ночную смену", False
-    kind, value = absence(p.note, report_date)
+    kind, value = absence(p.note)
     if kind == "row":
-        res.counts[value] += 1
+        res.add(value, short)
         return value, False
-    if kind == "arrival":
-        res.arrivals[value] += 1
-        return f"прибытие штатных {fmt(value)}", False
     if kind == "skip":
         return value, False
-    res.attention.append(f"{ts.site}: {p.name} ({p.position}, день {fmt(ts.date)}) — {value}. Впишите вручную.")
+    res.attention.append(f"{ts.site}: {p.name} ({p.position}, день {fmt(ts.date)}) — {value}.")
     return f"НЕ УЧТЁН: {value}", True
 
 
@@ -351,9 +362,16 @@ def find_blocks(ws) -> dict:
     return blocks
 
 
-def fill_block(ws, h: int, res: SiteResult, report_date: dt.date) -> list:
-    if norm(ws.cell(h + 7, 11).value) != "далее":
-        raise UserError("Шаблон рапорта изменён: не найдена строка «далее» в блоке прибытия.")
+def make_comment(lines: list) -> Comment:
+    """Примечание как в рапортах, составленных вручную: подпись, затем нумерованный список."""
+    body = [f"{i}. {line}" for i, line in enumerate(lines, start=1)]
+    text = f"{COMMENT_AUTHOR}:\n" + "\n".join(body)
+    width = max(144, 7 * max(len(s) for s in body))
+    height = max(79, 15 * (len(body) + 1) + 10)
+    return Comment(text, COMMENT_AUTHOR, height=height, width=width)
+
+
+def fill_block(ws, h: int, res: SiteResult):
     cells = {}
     for r in range(h + 1, h + 9):
         for label_col in (5, 7, 9):  # E, G, I — подписи; значение в соседней колонке
@@ -363,16 +381,10 @@ def fill_block(ws, h: int, res: SiteResult, report_date: dt.date) -> list:
     for label in AUTO_ROWS:
         if label not in cells:
             raise UserError(f"Шаблон рапорта изменён: не найдена строка «{label}».")
-        cells[label].value = res.counts.get(label) or None
-    notes = []
-    for d, n in sorted(res.arrivals.items()):
-        delta = (d - report_date).days
-        if delta < 0:
-            notes.append(f"прибытие {fmt(d)} — дата уже прошла, не внесено")
-            continue
-        cell = ws.cell(h + 2 + delta if delta <= 4 else h + 7, 12)
-        cell.value = (cell.value if isinstance(cell.value, (int, float)) else 0) + n
-    return notes
+        cell = cells[label]
+        cell.value = res.counts.get(label) or None
+        lines = res.names.get(label)
+        cell.comment = make_comment(lines) if lines else None
 
 
 def write_check_sheet(wb, report_date, todo, used, unused, rows):
@@ -437,10 +449,13 @@ def ask_report_date(default: dt.date) -> dt.date:
     if not sys.stdin.isatty():
         return default
     while True:
-        answer = input(
-            f"\nДата рапорта: {fmt(default)} (ночь {fmt(default - dt.timedelta(days=1))} + день {fmt(default)}).\n"
-            "Нажмите Enter, чтобы продолжить, или введите другую дату (ДД.ММ.ГГГГ): "
-        ).strip()
+        try:
+            answer = input(
+                f"\nДата рапорта: {fmt(default)} (ночь {fmt(default - dt.timedelta(days=1))} + день {fmt(default)}).\n"
+                "Нажмите Enter, чтобы продолжить, или введите другую дату (ДД.ММ.ГГГГ): "
+            ).strip()
+        except EOFError:  # ввода нет (на Windows NUL тоже считается терминалом)
+            return default
         if not answer:
             return default
         d = to_date(answer, year_hint=default.year)
@@ -469,7 +484,8 @@ def open_file(path: Path):
 
 
 def run(folder: Path) -> Path:
-    if not TEMPLATE_PATH.exists():
+    template = TEMPLATE_PATH if TEMPLATE_PATH.exists() else BUNDLED_TEMPLATE
+    if not template.exists():
         raise UserError(f"Не найден шаблон рапорта: {TEMPLATE_PATH}")
     if not folder.is_dir():
         raise UserError(f"Не найдена папка с табелями: {folder}")
@@ -501,10 +517,14 @@ def run(folder: Path) -> Path:
     if other_dates:
         unused_lines.append(f"Табели за другие даты: {other_dates} шт. (не нужны для этого рапорта)")
 
-    wb = openpyxl.load_workbook(TEMPLATE_PATH)
+    wb = openpyxl.load_workbook(template)
     ws = wb.worksheets[0]
     blocks = find_blocks(ws)
     ws["B1"].value = dt.datetime.combine(report_date, dt.time())
+    for row in ws.iter_rows():  # примечания из шаблона не переносим — программа ставит свои
+        for c in row:
+            if c.comment:
+                c.comment = None
 
     for site, _ in SITE_KEYWORDS:
         if site not in blocks:
@@ -525,16 +545,15 @@ def run(folder: Path) -> Path:
                     hint = f" Возможно, он среди файлов, которые программа не читает: {', '.join(scans)}."
                 todo.append(f"{site}: нет табеля смены «{shift}» за {fmt(d)} — в рапорте учтена только "
                             f"другая смена, добавьте эту вручную.{hint}")
-        res = count_site(site_sheets, report_date)
+        res = count_site(site_sheets)
         todo.extend(res.attention)
-        todo.extend(f"{site}: {n}" for n in fill_block(ws, blocks[site], res, report_date))
+        fill_block(ws, blocks[site], res)
         all_rows.extend(res.rows)
         for t in site_sheets:
             for p in t.people:
                 if p.kind and p.hours > 0:
                     seen.setdefault(person_key(p.name), []).append(f"{t.site} ({t.shift})")
         parts = [f"{k} {res.counts[k]}" for k in AUTO_ROWS if res.counts.get(k)]
-        parts += [f"прибытие {d.strftime('%d.%m')}: {n}" for d, n in sorted(res.arrivals.items())]
         summary.append(f"{site}: " + ", ".join(parts))
 
     for key, places in seen.items():
@@ -587,5 +606,8 @@ def main():
 if __name__ == "__main__":
     exit_code = main()
     if getattr(sys, "frozen", False) and sys.stdin.isatty():  # у .exe нет .bat с pause
-        input("\nНажмите Enter, чтобы закрыть окно ")
+        try:
+            input("\nНажмите Enter, чтобы закрыть окно ")
+        except EOFError:
+            pass
     sys.exit(exit_code)

@@ -18,18 +18,49 @@ jobs:
       - name: Установка зависимостей
         run: pip install openpyxl==3.1.5 pyinstaller==6.11.1
 
-      - name: Сборка
-        run: pyinstaller --onefile --console --name sobrat_raport app/sobrat_raport.py
+      - name: Сборка (шаблон рапорта вшивается в exe)
+        run: pyinstaller --onefile --console --name sobrat_raport --add-data "app/Шаблон рапорта.xlsx;." app/sobrat_raport.py
 
-      # Без шаблона рядом exe должен вежливо сообщить, что шаблона нет, — значит, всё упаковалось.
-      - name: Проверка запуска
-        shell: pwsh
+      # Полный прогон одиночного exe (без папки app рядом) на выдуманном табеле.
+      - name: Проверка exe на тестовом табеле
+        shell: python
         run: |
-          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-          $out = & .\dist\sobrat_raport.exe 2>&1 | Out-String
-          Write-Output $out
-          if ($out -match 'Traceback|Failed to execute' -or $out -notmatch 'xlsx') { exit 1 }
-          exit 0
+          import datetime as dt
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          import openpyxl
+
+          sys.stdout.reconfigure(encoding="utf-8")
+          dist = Path("dist")
+          tabeli = dist / "Табели"
+          tabeli.mkdir()
+          wb = openpyxl.Workbook()
+          ws = wb.active
+          ws["C4"], ws["E4"] = dt.datetime(2026, 10, 7), "День"
+          for col, title in zip("CEFH", ["ФИО", "Должность", "Часы", "Справка"]):
+              ws[f"{col}6"] = title
+          people = [
+              ("Мастеров Макар", "Мастер", 10, None),
+              ("Тестов Тимур", "ВЛ", 10, None),
+              ("Пробный Пётр", "сварщик", 10, "вцр"),
+              ("Образцов Олег", "сварщик", 0, "болен"),
+          ]
+          for row, (name, pos, hours, note) in enumerate(people, start=7):
+              ws[f"C{row}"], ws[f"E{row}"], ws[f"F{row}"], ws[f"H{row}"] = name, pos, hours, note
+          wb.save(tabeli / "Табель 07.10.2026 ХЛМ День.xlsx")
+
+          run = subprocess.run([str(dist / "sobrat_raport.exe")], capture_output=True, stdin=subprocess.DEVNULL)
+          print(run.stdout.decode("utf-8", "replace"), run.stderr.decode("utf-8", "replace"))
+          assert run.returncode == 0, f"exe завершился с кодом {run.returncode}"
+
+          report = openpyxl.load_workbook(dist / "Рапорты" / "Рапорт по персоналу 07.10.2026.xlsx")
+          sheet = report.worksheets[0]
+          got = (sheet["F5"].value, sheet["F11"].value, sheet["J5"].value)
+          print("ХЛМ: в производстве, ВЦР, простуда =", got)
+          assert got == (2, 1, 1), got
+          assert "Проверка" in report.sheetnames
 
       - uses: actions/upload-artifact@v4
         with:
